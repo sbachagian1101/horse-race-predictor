@@ -264,6 +264,13 @@ def _detail_header_matches(
     return sorted(found, key=lambda x: x[0])
 
 
+# Form figures line followed by a market line. The price may be a bare number,
+# "$22", or bookmaker-prefixed as copied from the live page: "betfair$22" / "Tab$4.2".
+_FORM_PRICE = re.compile(
+    r"(?mi)^\s*([fFxX0-9]{3,10})\s*$\s*^\s*(?:betfair|tab)?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)\s*$"
+)
+
+
 def _runner_blocks(raw: str, runners: list[dict[str, Any]]) -> dict[int, str]:
     """Split blocks using `RUNNER NAME ...yo`, which is stable across copy formats."""
     t = _clean_md(raw)
@@ -271,15 +278,10 @@ def _runner_blocks(raw: str, runners: list[dict[str, Any]]) -> dict[int, str]:
     blocks: dict[int, str] = {}
     for idx, (header_pos, tab, _) in enumerate(starts):
         end = starts[idx + 1][0] if idx + 1 < len(starts) else len(t)
-        prefix_start = max(0, header_pos - 180)
+        prefix_start = max(0, header_pos - 320)
         prefix = t[prefix_start:header_pos]
-        pair_matches = list(
-            re.finditer(
-                r"(?mi)^\s*([fFxX0-9]{3,10})\s*$\s*^\s*\$?([0-9]+(?:\.[0-9]+)?)\s*$",
-                prefix,
-            )
-        )
-        start = prefix_start + pair_matches[-1].start() if pair_matches else prefix_start
+        pair_matches = list(_FORM_PRICE.finditer(prefix))
+        start = prefix_start + pair_matches[-1].start() if pair_matches else header_pos
         blocks[tab] = t[start:end]
     return blocks
 
@@ -311,6 +313,77 @@ def _parse_record_value(value: str) -> tuple[str, int, int, int]:
         wins, p23, starts = map(int, m.groups())
         return f"{wins}-{p23}-{starts}", wins, p23, starts
     return "0-0-0", 0, 0, 0
+
+
+_FILTER_LABELS = [
+    "Car", "12m", "Crs", "Dist", "Crs & Dist",
+    "FU", "2U", "3U", "ClockW", "AClockW", "Dirt", "Sand",
+]
+
+_RECORD_VALUE = r"(\d+(?:\.\d+)?%?\s*-\s*\d+(?:\.\d+)?%?\s*-\s*\d+)"
+
+
+def _parse_filters(body: str) -> dict[str, str]:
+    """Parse the Filters section even when values are glued to the next label.
+
+    Live-page clipboard text flattens the WPS grid into runs like
+    ``Car 17%-17%-612m 17%-17%-6Crs ...`` where ``17%-17%-6`` is Car's value and
+    ``12m`` is the next label.  Each value is matched with a lookahead anchored on
+    the remaining labels so greedy backtracking splits the digits correctly
+    (``...-612m`` -> starts=6, label=12m; ``...-4212m`` -> starts=42).
+    """
+    m = re.search(r"(?is)\bFilters\b(.*?)(?:\bFacts\b|\Z)", body)
+    seg = re.sub(r"\s+", " ", m.group(1) if m else body)
+    out: dict[str, str] = {}
+    cur = 0
+    for i, label in enumerate(_FILTER_LABELS):
+        followers = [re.escape(x) for x in _FILTER_LABELS[i + 1 :]]
+        stop = r"(?=\s*(?:" + "|".join(followers + [r"Facts", r"\Z"]) + r"))"
+        pat = re.compile(re.escape(label) + r"\s*" + _RECORD_VALUE + stop, re.I)
+        got = pat.search(seg, cur)
+        if not got:
+            continue
+        out[label] = got.group(1)
+        cur = got.end()
+    return out
+
+
+def _parse_facts(body: str) -> dict[str, Any]:
+    """Parse the Facts strip (also glue-tolerant: ``$196DLS 7DLW 20(3)ROI ...``)."""
+    m = re.search(
+        r"(?is)\bFacts\b(.*?)(?:Best Winning Times|Days Since Last Run|\Z)", body
+    )
+    seg = re.sub(r"\s+", " ", m.group(1) if m else body)
+    d: dict[str, Any] = {}
+    got = re.search(r"(?<![A-Za-z])DLS\s*:?\s*(\d+)", seg, re.I)
+    if got:
+        d["dls"] = int(got.group(1))
+    got = re.search(r"(?<![A-Za-z])DLW\s*:?\s*(\d+)", seg, re.I)
+    if got:
+        d["dlw"] = int(got.group(1))
+    got = re.search(r"\bROI\s*:?\s*([+-]?\d+(?:\.\d+)?)\s*%", seg, re.I)
+    if got:
+        d["roi"] = _f(got.group(1)) / 100.0
+    got = re.search(r"\bCar PM\s*:?\s*\$([\d.,]+)\s*([kKmM]?)", seg, re.I)
+    if got:
+        val = _f(got.group(1))
+        unit = got.group(2).lower()
+        d["career_pm"] = val * 1_000_000 if unit == "m" else val * 1000 if unit == "k" else val
+    got = re.search(r"\b12m PM\s*:?\s*\$([\d.,]+)\s*([kKmM]?)", seg, re.I)
+    if got:
+        val = _f(got.group(1))
+        unit = got.group(2).lower()
+        d["pm_12m"] = val * 1_000_000 if unit == "m" else val * 1000 if unit == "k" else val
+    return d
+
+
+def _time_seconds(value: str) -> float:
+    """Convert '23.31' or '0:23.31' to seconds."""
+    s = str(value).strip()
+    if ":" in s:
+        head, _, tail = s.rpartition(":")
+        return _f(head) * 60.0 + _f(tail)
+    return _f(s)
 
 
 def _parse_box_stats(block: str) -> dict[int, dict[str, int]]:
@@ -413,31 +486,58 @@ def _parse_recent_runs(block: str) -> list[dict[str, Any]]:
 
 def _parse_block(block: str, runner: dict[str, Any]) -> dict[str, Any]:
     d: dict[str, Any] = {}
-    pair = re.search(
-        r"(?mi)^\s*([fFxX0-9]{3,10})\s*$\s*^\s*\$?([0-9]+(?:\.[0-9]+)?)\s*$",
-        block,
-    )
+    # Scope: everything before the "NAME ...yo" header belongs to the block
+    # prefix (form figures + market price); everything from the header onward is
+    # this runner's own data.  Restricting stats searches to `body` prevents a
+    # short previous block (e.g. a scratched dog) bleeding its box stats or
+    # track/distance best time into this runner.
+    hm = re.search(rf"(?mi)^\s*{re.escape(runner['horse'])}\s+(\d+)yo\b[^\n]*$", block)
+    head = block[: hm.start()] if hm else block[:400]
+    body = block[hm.start() :] if hm else block
+
+    pair = _FORM_PRICE.search(head) or _FORM_PRICE.search(block[:400])
     if pair:
         d["form"] = pair.group(1).lower()
         d["bf_odds"] = _f(pair.group(2), 999.0)
+
     m = re.search(
-        rf"(?mi)^\s*{re.escape(runner['horse'])}\s+(\d+)yo\s+([A-Z/]+)\s+([A-Z]+)\b",
-        block,
+        rf"(?mi)^\s*{re.escape(runner['horse'])}\s+(\d+)yo\s+([A-Z/ ]+?)\s+([A-Z])\s*$",
+        body,
     )
     if m:
-        d["age"], d["colour"], d["sex"] = int(m.group(1)), m.group(2), m.group(3)
-    value = _line_after_label(block, "Tra L50")
-    m = re.search(r"(\d+(?:\.\d+)?)%\s*-\s*(\d+(?:\.\d+)?)%\s*-\s*(\d+)", value)
+        d["age"], d["colour"], d["sex"] = int(m.group(1)), m.group(2).strip(), m.group(3)
+
+    # Trainer last-50: label and value may be glued ("Tra L5014%-36%-50").
+    m = re.search(
+        r"(?i)Tra\s*L50\s*:?\s*(\d+(?:\.\d+)?)\s*%\s*-\s*(\d+(?:\.\d+)?)\s*%\s*-\s*(\d+)",
+        body,
+    )
+    if not m:
+        m = re.search(
+            r"(\d+(?:\.\d+)?)%\s*-\s*(\d+(?:\.\d+)?)%\s*-\s*(\d+)",
+            _line_after_label(body, "Tra L50"),
+        )
     if m:
         d["trainer_win"] = float(m.group(1)) / 100.0
         d["trainer_place"] = float(m.group(2)) / 100.0
         d["trainer_l50_n"] = int(m.group(3))
-    value = _line_after_label(block, "Tra/Dist Best Time")
-    if value and not re.fullmatch(r"[-–—\\]+", value.strip()):
-        m = re.search(r"\d+(?:\.\d+)?", value)
-        if m:
-            d["tra_dist_best"] = _f(m.group(0))
-    d["box_stats"] = _parse_box_stats(block)
+
+    # Track/distance best time: same line, next line, or a dash for none.
+    m = re.search(
+        r"(?i)Tra/Dist\s*Best\s*Time\s*:?\s*(\d+:\d+(?:\.\d+)?|\d+(?:\.\d+)?)", body
+    )
+    if m:
+        d["tra_dist_best"] = _time_seconds(m.group(1))
+    else:
+        value = _line_after_label(body, "Tra/Dist Best Time")
+        if value and not re.fullmatch(r"[-–—\\]+", value.strip()):
+            m = re.search(r"\d+:\d+(?:\.\d+)?|\d+(?:\.\d+)?", value)
+            if m:
+                d["tra_dist_best"] = _time_seconds(m.group(0))
+
+    d["box_stats"] = _parse_box_stats(body)
+
+    filters = _parse_filters(body)
     for label, key in (
         ("Car", "career"),
         ("12m", "12m"),
@@ -448,24 +548,30 @@ def _parse_block(block: str, runner: dict[str, Any]) -> dict[str, Any]:
         ("2U", "2u"),
         ("3U", "3u"),
     ):
-        display, wins, p23, starts = _parse_record_value(_line_after_label(block, label))
+        value = filters.get(label) or _line_after_label(body, label)
+        display, wins, p23, starts = _parse_record_value(value)
         d[f"{key}_rec"] = display
         d[f"{key}_wins"] = wins
         d[f"{key}_places23"] = p23
         d[f"{key}_starts"] = starts
-    value = _line_after_label(block, "DLS")
-    m = re.search(r"\d+", value)
+
+    d.update(_parse_facts(body))
+    for label, key in (("DLS", "dls"), ("DLW", "dlw")):
+        if key in d:
+            continue
+        m = re.search(r"\d+", _line_after_label(body, label))
+        if m:
+            d[key] = int(m.group(0))
+
+    # "Days Since Last Run: 279 days (6U)" is the most authoritative freshness
+    # figure (it also survives spells) and carries runs-this-campaign.
+    m = re.search(r"(?i)Days Since Last Run:\s*(\d+)\s*days(?:\s*\((\d+)U\))?", body)
     if m:
-        d["dls"] = int(m.group(0))
-    value = _line_after_label(block, "DLW")
-    m = re.search(r"\d+", value)
-    if m:
-        d["dlw"] = int(m.group(0))
-    value = _line_after_label(block, "ROI")
-    m = re.search(r"([+-]?\d+(?:\.\d+)?)%?", value)
-    if m:
-        d["roi"] = _f(m.group(1)) / 100.0
-    d["recent_runs"] = _parse_recent_runs(block)
+        d["dls"] = int(m.group(1))
+        if m.group(2):
+            d["runs_this_prep"] = int(m.group(2))
+
+    d["recent_runs"] = _parse_recent_runs(body)
     return d
 
 
@@ -481,6 +587,9 @@ def parse(raw: str) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
             r.update(_parse_block(blocks[r["tab"]], r))
         else:
             warnings.append(f"No detail block found for #{r['tab']} {r['horse']}.")
+        if r.get("scratched"):
+            r["tab_odds"] = 999.0
+            r["bf_odds"] = 999.0
         r.setdefault("form", "")
         r.setdefault("bf_odds", r.get("tab_odds", 999.0))
         r.setdefault("trainer_win", 0.10)

@@ -1,9 +1,4 @@
-"""Streamlit interface for RaceParsePredict.
-
-Paste a Racing & Sports Enhanced Form page, parse the runners, and run the
-existing market + fundamentals + finishing-order model in a browser UI.
-"""
-
+"""Streamlit app for Racing & Sports greyhound form parsing and prediction."""
 from __future__ import annotations
 
 import io
@@ -12,349 +7,204 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-import model
-import rs_parser
+import greyhound_model as model
+import greyhound_parser as parser
 
-st.set_page_config(
-    page_title="RaceParsePredict",
-    page_icon="🏇",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.25rem; padding-bottom: 3rem;}
-    div[data-testid="stMetric"] {
-        border: 1px solid rgba(128,128,128,.22);
-        border-radius: .7rem;
-        padding: .55rem .8rem;
-    }
-    .race-hero {
-        padding: 1rem 1.1rem;
-        border-radius: .85rem;
-        background: linear-gradient(135deg, rgba(61,90,254,.16), rgba(0,0,0,0));
-        border: 1px solid rgba(128,128,128,.22);
-        margin-bottom: 1rem;
-    }
-    .winner-card {
-        padding: 1rem 1.2rem;
-        border: 1px solid rgba(46, 204, 113, .35);
-        border-radius: .8rem;
-        background: rgba(46, 204, 113, .08);
-        margin: .4rem 0 1rem 0;
-    }
-    .small-muted {opacity: .72; font-size: .9rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-PARSED_COLS = [
-    ("tab", "No"), ("horse", "Horse"), ("wt", "Wt"), ("bp", "BP"),
-    ("jockey", "Jockey"), ("claim", "Claim"), ("jrat", "JRat"),
-    ("trainer", "Trainer"), ("trat", "TRat"), ("tab_odds", "TAB$"),
-    ("bf_odds", "BF$"), ("ohr", "OHR"), ("form5", "Form"),
-    ("last_fin", "LastFin"), ("dslr", "DSLR"), ("runs_this_prep", "Prep"),
-    ("age", "Age"), ("sex", "Sex"), ("sire", "Sire"),
-    ("jky_win", "JkyW%"), ("trn_win", "TrnW%"), ("jt_win", "J/T%"),
-    ("Car_rec", "Career"), ("12m_rec", "12m"), ("Crs_rec", "Course"),
-    ("Dist_rec", "Dist"), ("CrsDist_rec", "C&D"), ("Good_rec", "Good"),
-    ("Soft_rec", "Soft"), ("Heavy_rec", "Heavy"),
-    ("career_pm_k", "CarPM$k"), ("pm_12m", "12mPM$"),
-    ("ls_margin", "LS Mgn"), ("ls_dist", "LS Dist"), ("ls_class", "LS Cls"),
-    ("ls_sp", "LS SP"), ("gear_change", "Gear"), ("had_trial", "Trial"),
-]
-
-PCT_KEYS = {"jky_win", "trn_win", "jt_win"}
+st.set_page_config(page_title="GreyhoundParsePredict", page_icon="🐕", layout="wide", initial_sidebar_state="expanded")
+st.markdown("""
+<style>
+.block-container {padding-top: 1.15rem; padding-bottom: 3rem;}
+div[data-testid="stMetric"] {border:1px solid rgba(128,128,128,.22);border-radius:.7rem;padding:.55rem .8rem;}
+.hero {padding:1rem 1.1rem;border-radius:.85rem;background:linear-gradient(135deg,rgba(124,77,255,.18),rgba(0,0,0,0));border:1px solid rgba(128,128,128,.22);margin-bottom:1rem;}
+.pick {padding:1rem 1.2rem;border:1px solid rgba(46,204,113,.35);border-radius:.8rem;background:rgba(46,204,113,.08);margin:.4rem 0 1rem 0;}
+.muted {opacity:.72;font-size:.9rem;}
+</style>
+""", unsafe_allow_html=True)
 
 
 def reset_app() -> None:
     st.session_state["paste_input"] = ""
-    for key in ("header", "runners", "warnings", "result"):
-        st.session_state.pop(key, None)
+    for k in ("header", "runners", "warnings", "result"):
+        st.session_state.pop(k, None)
 
 
-def race_title(header: dict[str, Any]) -> str:
-    bits = []
-    if header.get("track"):
-        bits.append(str(header["track"]))
-    if header.get("race_name"):
-        bits.append(str(header["race_name"]))
-    return " — ".join(bits) or "Parsed race"
+def race_title(h: dict[str, Any]) -> str:
+    bits = [str(h.get("track", "")).strip(), f"R{h.get('race_no')}" if h.get("race_no") else "", str(h.get("race_name", "")).strip()]
+    return " · ".join(x for x in bits if x) or "Parsed greyhound race"
 
 
-def race_subtitle(header: dict[str, Any]) -> str:
-    left = " ".join(
-        str(x) for x in (
-            f"{header.get('distance_m')}m" if header.get("distance_m") else "",
-            header.get("surface", ""),
-            header.get("going", ""),
-        ) if x
-    )
-    bits = [left, header.get("prize", ""), header.get("date", "")]
+def race_subtitle(h: dict[str, Any]) -> str:
+    bits = [f"{h.get('distance_m')}m" if h.get("distance_m") else "", h.get("surface", ""), h.get("going", ""), h.get("race_type", ""), h.get("prize", ""), h.get("date", "")]
     return " | ".join(str(x) for x in bits if x)
 
 
-def parsed_dataframe(runners: list[dict[str, Any]]) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for runner in runners:
-        row: dict[str, Any] = {}
-        for key, label in PARSED_COLS:
-            value = runner.get(key, "")
-            if isinstance(value, bool):
-                value = "Y" if value else ""
-            elif key in PCT_KEYS and isinstance(value, (int, float)):
-                value = value * 100
-            row[label] = value
-        rows.append(row)
-    return pd.DataFrame(rows)
+def rec_str(r: dict[str, Any], prefix: str) -> str:
+    return str(r.get(f"{prefix}_rec", "0-0-0"))
 
 
-def prediction_dataframe(
-    runners: list[dict[str, Any]], result: dict[str, Any]
-) -> pd.DataFrame:
+def parsed_df(runners: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
-    for rank, i in enumerate(result["order"], start=1):
-        p_win = float(result["p_win"][i])
+    for r in runners:
+        box = int(r.get("box", 0) or 0)
+        bs = r.get("box_stats", {}).get(box, {}) if box else {}
+        recent = r.get("recent_runs", []); last = recent[0] if recent else {}
         rows.append({
-            "Pred": rank,
-            "No": runners[i]["tab"],
-            "Horse": runners[i]["horse"],
-            "Mkt%": float(result["p_mkt"][i]) * 100,
-            "Fund%": float(result["p_fund"][i]) * 100,
-            "Win%": p_win * 100,
-            "Top3%": float(result["top3"][i]) * 100,
-            "E[pos]": float(result["exp_pos"][i]),
-            "Fair$": (1 / p_win) if p_win > 0 else float("inf"),
-            "BF$": float(runners[i]["bf_odds"]),
-            "EV": float(result["ev_win"][i]),
-            "Conf": int(result["conf"][i]),
-            "Recommendation": result["recs"][i],
+            "Tab": r.get("tab"), "Box": box or "", "Greyhound": r.get("horse"), "Scr": "Y" if r.get("scratched") else "",
+            "Wt": r.get("weight"), "Trainer": r.get("trainer"), "TAB$": r.get("tab_odds"), "BF$": r.get("bf_odds"),
+            "Form": r.get("form", ""), "Tra W%": 100*r.get("trainer_win", 0), "Tra P%": 100*r.get("trainer_place", 0),
+            "Tra/Dist Best": r.get("tra_dist_best") or "", "Career": rec_str(r,"career"), "Course": rec_str(r,"course"),
+            "Dist": rec_str(r,"distance"), "C&D": rec_str(r,"course_distance"), "DLS": r.get("dls"),
+            "Box W-S": f"{bs.get('wins',0)}-{bs.get('starts',0)}", "Last Fin": last.get("finish", ""),
+            "Last Mgn": last.get("margin", ""), "Last MRKΔ": last.get("mrk_delta", ""), "Last Split": last.get("first_split", ""),
+            "Last Settle": last.get("settle_pos", ""), "Last Note": last.get("stewards", ""),
         })
     return pd.DataFrame(rows)
 
 
-def dataframe_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
+def prediction_df(result: dict[str, Any]) -> pd.DataFrame:
+    rows = []; active = result["runners"]; c = result["components"]
+    for rank, i in enumerate(result["order"], start=1):
+        r = active[i]
+        rows.append({
+            "Pred": rank, "Tab": r.get("tab"), "Box": r.get("box"), "Greyhound": r.get("horse"),
+            "Early": int(result["early_rank"][i]), "Market%": 100*result["p_mkt"][i], "Fund%": 100*result["p_fund"][i],
+            "Win%": 100*result["p_win"][i], "Top2%": 100*result["top2"][i], "Top3%": 100*result["top3"][i],
+            "E[pos]": result["exp_pos"][i], "Fair$": result["fair"][i], "BF$": r.get("bf_odds"), "EV": result["ev_win"][i],
+            "Conf": result["conf"][i], "Speed Z": c["speed"][i], "Early Z": c["early"][i], "Box Z": c["box"][i],
+            "C&D Z": c["trackdist"][i], "Form Z": c["form"][i], "Recommendation": result["recs"][i],
+        })
+    return pd.DataFrame(rows)
 
 
-for key, default in (
-    ("header", {}),
-    ("runners", []),
-    ("warnings", []),
-    ("result", None),
-):
-    st.session_state.setdefault(key, default)
+def speed_map_df(result: dict[str, Any]) -> pd.DataFrame:
+    active = result["runners"]; rows = []
+    for idx in result["early_order"]:
+        r = active[idx]
+        rows.append({"Early Rank": int(result["early_rank"][idx]), "Box": r.get("box"), "Greyhound": r.get("horse"),
+                     "Early Score": result["components"]["early_raw"][idx], "Win%": 100*result["p_win"][idx]})
+    return pd.DataFrame(rows)
 
-st.markdown(
-    """
-    <div class="race-hero">
-      <h1 style="margin:0">🏇 RaceParsePredict</h1>
-      <div class="small-muted">Racing & Sports Enhanced Form parser + race prediction model</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+
+def csv_bytes(df: pd.DataFrame) -> bytes:
+    s = io.StringIO(); df.to_csv(s, index=False); return s.getvalue().encode("utf-8")
+
+for k, v in (("header", {}), ("runners", []), ("warnings", []), ("result", None)):
+    st.session_state.setdefault(k, v)
+
+st.markdown('<div class="hero"><h1 style="margin:0">🐕 GreyhoundParsePredict</h1><div class="muted">Racing & Sports Enhanced Form parser · greyhound speed-map + probability model</div></div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Model settings")
-    alpha = st.slider(
-        "Market weight α",
-        min_value=0.50,
-        max_value=0.99,
-        value=float(model.MARKET_ALPHA),
-        step=0.01,
-        help="Higher values make the final probability follow market prices more closely.",
-    )
-    sims = st.select_slider(
-        "Monte Carlo simulations",
-        options=[5_000, 10_000, 20_000, 30_000, 50_000],
-        value=30_000,
-        help="More simulations reduce sampling noise but take longer.",
-    )
-    seed = st.number_input("Random seed", min_value=0, max_value=999_999, value=42, step=1)
+    alpha = st.slider("Market weight α", .30, .90, float(model.MARKET_ALPHA), .01,
+                      help="Higher = final probabilities follow market odds more closely; lower = fundamentals matter more.")
+    sims = st.select_slider("Finishing-order simulations", options=[5_000,10_000,20_000,30_000,50_000], value=20_000)
+    seed = st.number_input("Random seed", 0, 999999, 42, 1)
     st.divider()
-    st.caption(
-        "Pipeline: Shin de-vig → market/fundamental blend → discounted "
-        "Plackett–Luce finishing-order simulation."
-    )
-    st.caption("This is a decision-support model, not a guarantee of race outcomes.")
+    st.caption("Greyhound fundamentals: adjusted speed/MRK → early pace → box history → track & distance → recent form → trainer → freshness.")
+    st.caption("Prediction is probabilistic decision support, not a guaranteed outcome.")
 
-paste_tab, parsed_tab, pred_tab, explain_tab, method_tab = st.tabs(
-    ["1 · Paste Data", "2 · Parsed Data", "3 · Prediction", "4 · Explanations", "Method"]
-)
+paste_tab, parsed_tab, speed_tab, pred_tab, explain_tab, method_tab = st.tabs([
+    "1 · Paste Data", "2 · Parsed Data", "3 · Speed Map", "4 · Prediction", "5 · Explanations", "Method"
+])
 
 with paste_tab:
-    st.subheader("Paste the full Racing & Sports Enhanced Form page")
-    st.caption("On the source page: select all → copy → paste into the box below.")
-    pasted = st.text_area(
-        "Race data",
-        key="paste_input",
-        height=430,
-        placeholder="Paste Racing & Sports Enhanced Form text here…",
-        label_visibility="collapsed",
-    )
-    c1, c2, c3 = st.columns([1, 1, 5])
-    with c1:
-        parse_clicked = st.button("Parse race ▶", type="primary", use_container_width=True)
-    with c2:
-        st.button("Clear", on_click=reset_app, use_container_width=True)
-
+    st.subheader("Paste the full Racing & Sports greyhound Enhanced Form page")
+    st.caption("Select all on the Enhanced Form page, copy, then paste below. Scratches and reserves are handled automatically where the field table identifies them.")
+    pasted = st.text_area("Race data", key="paste_input", height=430, placeholder="Paste greyhound Enhanced Form text here…", label_visibility="collapsed")
+    c1,c2,c3 = st.columns([1,1,5])
+    with c1: parse_clicked = st.button("Parse race ▶", type="primary", use_container_width=True)
+    with c2: st.button("Clear", on_click=reset_app, use_container_width=True)
     if parse_clicked:
-        if len(pasted.strip()) < 200:
-            st.error("The pasted text looks too short. Paste the full Enhanced Form page and try again.")
+        if len(pasted.strip()) < 300:
+            st.error("The pasted text looks too short. Paste the full Enhanced Form page.")
         else:
             try:
-                header, runners, warnings = rs_parser.parse(pasted)
-                st.session_state["header"] = header
-                st.session_state["runners"] = runners
-                st.session_state["warnings"] = warnings
-                st.session_state["result"] = None
-                if runners:
-                    st.success(f"Parsed {len(runners)} runners. Open **2 · Parsed Data** to verify them.")
-                else:
-                    st.error("No runners were found in the pasted text.")
-            except Exception as exc:
-                st.exception(exc)
-
-    if st.session_state["runners"]:
-        st.info(
-            f"Current race: **{race_title(st.session_state['header'])}** — "
-            f"{len(st.session_state['runners'])} runners parsed."
-        )
+                h, rs, ws = parser.parse(pasted)
+                st.session_state.update(header=h, runners=rs, warnings=ws, result=None)
+                active = [r for r in rs if not r.get("scratched")]
+                if active: st.success(f"Parsed {len(rs)} listed runners: {len(active)} active and {len(rs)-len(active)} scratched.")
+                else: st.error("No active runners were found.")
+            except Exception as exc: st.exception(exc)
+    if st.session_state["runners"]: st.info(f"Current race: **{race_title(st.session_state['header'])}**")
     if st.session_state["warnings"]:
         with st.expander(f"Parser warnings ({len(st.session_state['warnings'])})"):
-            for warning in st.session_state["warnings"]:
-                st.warning(warning)
+            for w in st.session_state["warnings"]: st.warning(w)
 
 with parsed_tab:
-    runners = st.session_state["runners"]
-    header = st.session_state["header"]
-    if not runners:
-        st.info("Parse a race in **1 · Paste Data** first.")
+    rs, h = st.session_state["runners"], st.session_state["header"]
+    if not rs: st.info("Parse a race in **1 · Paste Data** first.")
     else:
-        st.subheader(race_title(header))
-        st.caption(race_subtitle(header))
-        parsed_df = parsed_dataframe(runners)
-        st.dataframe(
-            parsed_df,
-            use_container_width=True,
-            hide_index=True,
-            height=520,
-            column_config={
-                "JkyW%": st.column_config.NumberColumn(format="%.1f%%"),
-                "TrnW%": st.column_config.NumberColumn(format="%.1f%%"),
-                "J/T%": st.column_config.NumberColumn(format="%.1f%%"),
-            },
-        )
-        st.download_button(
-            "Download parsed data (CSV)",
-            data=dataframe_csv_bytes(parsed_df),
-            file_name="parsed_race.csv",
-            mime="text/csv",
-        )
+        st.subheader(race_title(h)); st.caption(race_subtitle(h)); df = parsed_df(rs)
+        st.dataframe(df, use_container_width=True, hide_index=True, height=520,
+                     column_config={"Tra W%":st.column_config.NumberColumn(format="%.1f%%"),"Tra P%":st.column_config.NumberColumn(format="%.1f%%")})
+        st.download_button("Download parsed data (CSV)", data=csv_bytes(df), file_name="greyhound_parsed.csv", mime="text/csv")
+
+with speed_tab:
+    rs, h = st.session_state["runners"], st.session_state["header"]
+    if not rs: st.info("Parse a race first.")
+    else:
+        if st.button("Build speed map ▶", type="primary"):
+            try: st.session_state["result"] = model.predict(rs, h, alpha=float(alpha), sims=int(sims), seed=int(seed))
+            except Exception as exc: st.exception(exc)
+        result = st.session_state["result"]
+        if result:
+            sdf = speed_map_df(result); leader = sdf.iloc[0]
+            st.markdown(f"### Projected leader: **Box {leader['Box']} · {leader['Greyhound']}**")
+            st.dataframe(sdf, use_container_width=True, hide_index=True,
+                         column_config={"Win%": st.column_config.NumberColumn(format="%.1f%%"), "Early Score": st.column_config.NumberColumn(format="%.3f")})
+            st.caption("The speed map uses recent settling position/start notes plus the current box profile. Raw first-split seconds are not compared blindly across different tracks/distances.")
 
 with pred_tab:
-    runners = st.session_state["runners"]
-    header = st.session_state["header"]
-    if not runners:
-        st.info("Parse and verify a race first.")
+    rs, h = st.session_state["runners"], st.session_state["header"]
+    if not rs: st.info("Parse a race first.")
     else:
-        st.subheader("Run prediction")
-        st.caption(
-            f"Using market weight α={alpha:.2f}, {int(sims):,} simulations, seed {int(seed)}."
-        )
-        if st.button("Predict race ▶", type="primary", key="predict_button"):
+        st.subheader(race_title(h)); st.caption(race_subtitle(h))
+        if st.button("Predict race ▶", type="primary", key="predict"):
             try:
-                with st.spinner("Running prediction model…"):
-                    st.session_state["result"] = model.predict(
-                        runners,
-                        header,
-                        alpha=float(alpha),
-                        sims=int(sims),
-                        seed=int(seed),
-                    )
-            except Exception as exc:
-                st.exception(exc)
-
+                with st.spinner("Running greyhound ensemble and finishing-order simulation…"):
+                    st.session_state["result"] = model.predict(rs, h, alpha=float(alpha), sims=int(sims), seed=int(seed))
+            except Exception as exc: st.exception(exc)
         result = st.session_state["result"]
-        if result is not None:
-            pred_df = prediction_dataframe(runners, result)
-            winner = pred_df.iloc[0]
-            st.markdown(
-                f"""
-                <div class="winner-card">
-                  <div class="small-muted">MODEL TOP PICK</div>
-                  <h2 style="margin:.1rem 0">#{int(winner['No'])} {winner['Horse']}</h2>
-                  <b>Win {winner['Win%']:.1f}%</b> · Top 3 {winner['Top3%']:.1f}% ·
-                  Fair ${winner['Fair$']:.2f} · EV {winner['EV']:.2f} · Confidence {int(winner['Conf'])}/9
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Overall confidence", f"{result['overall_conf']}/9")
-            m2.metric("TAB overround", f"{result['overround_tab']:.3f}")
-            m3.metric("Shin z", f"{result['shin_z']:.4f}")
-            m4.metric("Betfair book", f"{result['book_bf']:.3f}")
-
-            st.dataframe(
-                pred_df,
-                use_container_width=True,
-                hide_index=True,
-                height=520,
-                column_config={
-                    "Mkt%": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Fund%": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Win%": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-                    "Top3%": st.column_config.NumberColumn(format="%.1f%%"),
-                    "E[pos]": st.column_config.NumberColumn(format="%.2f"),
-                    "Fair$": st.column_config.NumberColumn(format="$%.2f"),
-                    "BF$": st.column_config.NumberColumn(format="$%.2f"),
-                    "EV": st.column_config.NumberColumn(format="%.2f"),
-                    "Conf": st.column_config.NumberColumn("Conf 0–9", format="%d"),
-                },
-            )
-            st.download_button(
-                "Download prediction (CSV)",
-                data=dataframe_csv_bytes(pred_df),
-                file_name="race_prediction.csv",
-                mime="text/csv",
-            )
+        if result:
+            df = prediction_df(result); winner = df.iloc[0]
+            st.markdown(f'<div class="pick"><div class="muted">MODEL TOP PICK</div><h2 style="margin:.1rem 0">Box {winner["Box"]} · {winner["Greyhound"]}</h2><b>Win {winner["Win%"]:.1f}%</b> · Top 3 {winner["Top3%"]:.1f}% · Fair ${winner["Fair$"]:.2f} · EV {winner["EV"]:+.2f} · Confidence {int(winner["Conf"])}/9</div>', unsafe_allow_html=True)
+            m1,m2,m3,m4 = st.columns(4)
+            m1.metric("Overall confidence", f"{result['overall_conf']}/9"); m2.metric("Market weight", f"{alpha:.2f}")
+            m3.metric("Projected leader", str(result["runners"][result["early_order"][0]]["horse"])); m4.metric("Active field", str(len(result["runners"])))
+            st.dataframe(df, use_container_width=True, hide_index=True, height=520, column_config={
+                "Market%":st.column_config.NumberColumn(format="%.1f%%"),"Fund%":st.column_config.NumberColumn(format="%.1f%%"),
+                "Win%":st.column_config.ProgressColumn(format="%.1f%%",min_value=0,max_value=100),"Top2%":st.column_config.NumberColumn(format="%.1f%%"),
+                "Top3%":st.column_config.NumberColumn(format="%.1f%%"),"E[pos]":st.column_config.NumberColumn(format="%.2f"),
+                "Fair$":st.column_config.NumberColumn(format="$%.2f"),"BF$":st.column_config.NumberColumn(format="$%.2f"),"EV":st.column_config.NumberColumn(format="%+.2f"),
+                "Speed Z":st.column_config.NumberColumn(format="%+.2f"),"Early Z":st.column_config.NumberColumn(format="%+.2f"),"Box Z":st.column_config.NumberColumn(format="%+.2f"),
+                "C&D Z":st.column_config.NumberColumn(format="%+.2f"),"Form Z":st.column_config.NumberColumn(format="%+.2f"),})
+            st.download_button("Download prediction (CSV)", data=csv_bytes(df), file_name="greyhound_prediction.csv", mime="text/csv")
 
 with explain_tab:
-    runners = st.session_state["runners"]
     result = st.session_state["result"]
-    if result is None or not runners:
-        st.info("Run the model in **3 · Prediction** first.")
+    if not result: st.info("Run the prediction first.")
     else:
-        st.subheader(f"Runner explanations · overall confidence {result['overall_conf']}/9")
+        st.subheader(f"Runner explanations · confidence {result['overall_conf']}/9")
         for rank, i in enumerate(result["order"], start=1):
-            runner = runners[i]
-            title = (
-                f"{rank}. #{runner['tab']} {runner['horse']} — "
-                f"Win {result['p_win'][i] * 100:.1f}% · Conf {result['conf'][i]}/9"
-            )
-            with st.expander(title, expanded=(rank <= 3)):
-                st.markdown(f"**Recommendation:** {result['recs'][i]}")
-                st.text(result["why"][i])
+            r = result["runners"][i]
+            with st.expander(f"{rank}. Box {r.get('box')} · {r.get('horse')} — Win {result['p_win'][i]*100:.1f}% · {result['recs'][i]}", expanded=rank<=3):
+                st.markdown(f"**{result['recs'][i]}**"); st.write(result["why"][i]); c = result["components"]
+                st.dataframe(pd.DataFrame([{"Speed Z":c["speed"][i],"Early Z":c["early"][i],"Box Z":c["box"][i],"Track/Dist Z":c["trackdist"][i],
+                                            "Form Z":c["form"][i],"Trainer Z":c["trainer"][i],"Freshness Z":c["freshness"][i]}]), hide_index=True, use_container_width=True)
 
 with method_tab:
-    st.subheader("How the model works")
-    st.markdown(
-        """
-        The app keeps the prediction engine supplied in the original desktop program:
+    st.subheader("How the greyhound model works")
+    st.markdown("""
+1. **Field parsing** — extracts the race, active runners, scratches/reserves, weights, trainers and prices.
+2. **Adjusted speed** — recent R&S **BOM Time Adj** and **MRK delta** are recency-weighted, with extra weight for the same/similar distance and track.
+3. **Early pace / speed map** — settling positions and steward start notes estimate early position. The current box profile is added and a mild pace-clash adjustment is applied.
+4. **Box model** — uses each dog's own historical win/place/start record from the **current assigned box**, shrunk toward a broad baseline when the sample is small.
+5. **Track & distance** — Course, Distance and Course & Distance records plus trainer/distance best time where available.
+6. **Form, trainer and freshness** — recent finishing position/margins, trainer L50 strike rates and days since last start.
+7. **Fundamental probability** — component scores are standardized across the field and combined into a greyhound-specific ensemble.
+8. **Market blend** — TAB/Betfair probabilities are de-vigged and blended with fundamentals. The sidebar α controls market influence.
+9. **Finishing-order simulation** — Plackett-Luce simulations estimate Top-2, Top-3 and expected finishing position.
+10. **Value screen** — model fair odds are compared with the listed exchange price to estimate EV.
 
-        1. **Market probabilities** — TAB fixed odds are de-vigged with a Shin-style adjustment and combined with normalized Betfair prices.
-        2. **Fundamental score** — official rating, weight, career/distance/going records, jockey/trainer figures, last-start finish, freshness and R&S ratings are standardized and combined.
-        3. **Benter-style blend** — market and fundamental probabilities are combined in log-probability space. The sidebar **α** controls how strongly the market is weighted.
-        4. **Finishing-order simulation** — a discounted Plackett–Luce process simulates the complete finishing order and produces expected position and Top-3 probability.
-        5. **Value screen** — Betfair odds are compared with model win probability to calculate EV and assign a recommendation.
-
-        **Important:** confidence and EV are model outputs based on the pasted data and market prices. They are not guarantees and should not be treated as certain outcomes.
-        """
-    )
+**Important:** track-specific box bias and fully normalized sectional databases would improve the model further. This version deliberately avoids comparing raw split seconds across unrelated tracks/distances when that would be misleading.
+""")

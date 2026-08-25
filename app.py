@@ -45,14 +45,14 @@ st.markdown(
         background: rgba(46, 204, 113, .08);
         margin: .4rem 0 1rem 0;
     }
-    .small-muted {opacity: .72; font-size: .9rem;}
+    .small-muted {opacity: .72; font-size:.9rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 PARSED_COLS = [
-    ("tab", "No"), ("horse", "Horse"), ("wt", "Wt"), ("bp", "BP"),
+    ("tab", "No"), ("horse", "Horse"), ("scratched", "Scr"), ("wt", "Wt"), ("bp", "BP"),
     ("jockey", "Jockey"), ("claim", "Claim"), ("jrat", "JRat"),
     ("trainer", "Trainer"), ("trat", "TRat"), ("tab_odds", "TAB$"),
     ("bf_odds", "BF$"), ("ohr", "OHR"), ("form5", "Form"),
@@ -115,20 +115,21 @@ def parsed_dataframe(runners: list[dict[str, Any]]) -> pd.DataFrame:
 def prediction_dataframe(
     runners: list[dict[str, Any]], result: dict[str, Any]
 ) -> pd.DataFrame:
+    used_runners = result.get("runners", runners)
     rows = []
     for rank, i in enumerate(result["order"], start=1):
         p_win = float(result["p_win"][i])
         rows.append({
             "Pred": rank,
-            "No": runners[i]["tab"],
-            "Horse": runners[i]["horse"],
+            "No": used_runners[i]["tab"],
+            "Horse": used_runners[i]["horse"],
             "Mkt%": float(result["p_mkt"][i]) * 100,
             "Fund%": float(result["p_fund"][i]) * 100,
             "Win%": p_win * 100,
             "Top3%": float(result["top3"][i]) * 100,
             "E[pos]": float(result["exp_pos"][i]),
             "Fair$": (1 / p_win) if p_win > 0 else float("inf"),
-            "BF$": float(runners[i]["bf_odds"]),
+            "BF$": float(used_runners[i]["bf_odds"]),
             "EV": float(result["ev_win"][i]),
             "Conf": int(result["conf"][i]),
             "Recommendation": result["recs"][i],
@@ -215,7 +216,13 @@ with paste_tab:
                 st.session_state["warnings"] = warnings
                 st.session_state["result"] = None
                 if runners:
-                    st.success(f"Parsed {len(runners)} runners. Open **2 · Parsed Data** to verify them.")
+                    active_count = sum(not r.get("scratched") for r in runners)
+                    scratched_count = len(runners) - active_count
+                    st.success(
+                        f"Parsed {len(runners)} listed runners: {active_count} active"
+                        + (f" and {scratched_count} scratched." if scratched_count else ".")
+                        + " Open **2 · Parsed Data** to verify them."
+                    )
                 else:
                     st.error("No runners were found in the pasted text.")
             except Exception as exc:
@@ -271,13 +278,18 @@ with pred_tab:
         if st.button("Predict race ▶", type="primary", key="predict_button"):
             try:
                 with st.spinner("Running prediction model…"):
-                    st.session_state["result"] = model.predict(
-                        runners,
+                    active_runners = [r for r in runners if not r.get("scratched")]
+                    if len(active_runners) < 2:
+                        raise ValueError("At least two active runners are required.")
+                    result = model.predict(
+                        active_runners,
                         header,
                         alpha=float(alpha),
                         sims=int(sims),
                         seed=int(seed),
                     )
+                    result["runners"] = active_runners
+                    st.session_state["result"] = result
             except Exception as exc:
                 st.exception(exc)
 
@@ -333,8 +345,9 @@ with explain_tab:
         st.info("Run the model in **3 · Prediction** first.")
     else:
         st.subheader(f"Runner explanations · overall confidence {result['overall_conf']}/9")
+        used_runners = result.get("runners", runners)
         for rank, i in enumerate(result["order"], start=1):
-            runner = runners[i]
+            runner = used_runners[i]
             title = (
                 f"{rank}. #{runner['tab']} {runner['horse']} — "
                 f"Win {result['p_win'][i] * 100:.1f}% · Conf {result['conf'][i]}/9"
